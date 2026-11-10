@@ -26,6 +26,7 @@ Xiaomi-OCR-0 是一个统一的 0.8B 视觉语言模型，面向文档解析与 
 
 ## 📰 更新日志
 
+- **2026-11-10：** 试试 [Any2Markdown](https://github.com/SeerRay-Lab/Any2Markdown)，它以 Xiaomi-OCR-0 为默认 OCR 模型，轻松将 PDF、Office 文档、图片和网页转换为 Markdown。
 - **2026-10-08：** 感谢社区对 Xiaomi-OCR-0 的支持与贡献：[prithivMLmods 的 GGUF 版本](https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF)、[xzl01 的 GGUF 版本](https://github.com/xzl01/Xiaomi-OCR-0-GGUF)，以及 [ByronLeeee 的 BF16 NInfer 转换版](https://huggingface.co/ByronLeeee/Xiaomi-OCR-0-Ninfer)。
 - **2026-09-30：** 技术报告发布、模型权重开源。
 

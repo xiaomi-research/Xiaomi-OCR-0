@@ -29,6 +29,7 @@ see [Key Performance](#key-performance) for the comparison tables and scope.
 
 ## 📰 News
 
+- **2026-11-10:** Try [Any2Markdown](https://github.com/SeerRay-Lab/Any2Markdown) to turn PDFs, Office documents, images, and web pages into clean Markdown with Xiaomi-OCR-0 as the default OCR model.
 - **2026-10-08:** Thanks to the community for supporting Xiaomi-OCR-0 and sharing new formats: [prithivMLmods’ GGUF](https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF), [xzl01’s GGUF](https://github.com/xzl01/Xiaomi-OCR-0-GGUF), and [ByronLeeee’s BF16 NInfer conversion](https://huggingface.co/ByronLeeee/Xiaomi-OCR-0-Ninfer).
 - **2026-09-30:** Technical report published and model weights released.
 
