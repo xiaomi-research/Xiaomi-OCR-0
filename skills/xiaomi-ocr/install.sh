@@ -5,6 +5,7 @@ set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_URL="${XIAOMI_OCR_LOCAL_URL:-http://127.0.0.1:8000/v1}"
 MODEL="${XIAOMI_OCR_MODEL:-SeerRay-Lab/Xiaomi-OCR-0}"
+OCR_BACKEND="${XIAOMI_OCR_BACKEND:-openai}"
 VENV="$SKILL_DIR/.venv"
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
@@ -51,13 +52,14 @@ if [[ ! -f "$REPO_DIR/postprocess/document.py" ]]; then
   exit 1
 fi
 export XIAOMI_OCR_REPO="$REPO_DIR"
-"$PY" - "$SKILL_DIR/mcp-config.json" "$PY" "$SKILL_DIR/mcp_ocr_server.py" "$LOCAL_URL" "$MODEL" "$REPO_DIR" <<'PYCONFIG'
+"$PY" - "$SKILL_DIR/mcp-config.json" "$PY" "$SKILL_DIR/mcp_ocr_server.py" "$LOCAL_URL" "$MODEL" "$REPO_DIR" "$OCR_BACKEND" <<'PYCONFIG'
 import json, sys
 from pathlib import Path
-output, python, server, url, model, repo = sys.argv[1:]
+output, python, server, url, model, repo, backend = sys.argv[1:]
 Path(output).write_text(json.dumps({"mcpServers": {"xiaomi-ocr": {
     "command": python, "args": [server], "env": {
-        "XIAOMI_OCR_LOCAL_URL": url, "XIAOMI_OCR_MODEL": model, "XIAOMI_OCR_REPO": repo
+        "XIAOMI_OCR_LOCAL_URL": url, "XIAOMI_OCR_MODEL": model, "XIAOMI_OCR_REPO": repo,
+        "XIAOMI_OCR_BACKEND": backend
     }}}}, indent=2) + "\n")
 PYCONFIG
 
@@ -68,4 +70,4 @@ if [[ "${1:-}" == "--agent=codex" ]]; then
 else
   echo "Merge mcp-config.json into your current agent settings; Codex auto-registration requires --agent=codex."
 fi
-echo "Start SGLang or vLLM locally before testing OCR. Region mode also needs local PaddleX/PaddlePaddle."
+echo "Start your local inference backend before using OCR. Region mode also needs local PaddleX/PaddlePaddle."

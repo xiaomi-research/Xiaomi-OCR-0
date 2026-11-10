@@ -18,8 +18,8 @@ responses = [json.loads(line) for line in proc.stdout.splitlines() if line.strip
 if len(responses) != 2:
     raise SystemExit(f"Expected two MCP responses, got {len(responses)}; stderr={proc.stderr}")
 tools = {tool["name"] for tool in responses[1]["result"]["tools"]}
-expected = {"ocr_image", "ocr_pdf", "kie_image", "vqa_image"}
+expected = {"ocr_image", "ocr_pdf", "kie_image", "vqa_image", "runtime_status"}
 if tools != expected:
     raise SystemExit(f"Unexpected MCP tool list: {sorted(tools)}")
-print("MCP handshake OK; OCR, PDF, KIE, and VQA tools are registered.")
+print("MCP handshake OK; OCR, PDF, KIE, VQA, and runtime_status tools are registered.")
 print("Start local SGLang/vLLM to run an inference smoke test.")

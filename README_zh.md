@@ -165,6 +165,29 @@ python -m pip install -r requirements-paddlex.txt
 
 该清单包含 `paddlex[cv]` 和 `shapely`；PaddlePaddle 需按官方教程单独安装。首次使用时会下载尚未缓存的 PP-DocLayoutV3 权重。使用 CPU 做版面检测时，在 Demo 或 MCP 环境中设置 `XIAOMI_OCR_LAYOUT_DEVICE=cpu`。整页 OCR、KIE 和 VQA 无需这些额外依赖。
 
+## 输出长度与任务状态
+
+文档解析和字段提取的默认输出上限是 **4096 Token**。在 Demo 右上角打开
+**设置 → 最大输出 Token**，修改并保存后再开始任务。通过 MCP 使用时，给
+`ocr_image`、`ocr_pdf` 或 `kie_image` 传入 `max_tokens`。例如，下面的
+`ocr_pdf` 参数允许每个区域最多输出 8192 Token：
+
+```json
+{"pdf_path": "/absolute/path/document.pdf", "mode": "region", "max_tokens": 8192}
+```
+
+Page 模式按每页计算上限；Region 模式按每个检测出的区域计算，文字、表格和公式
+都使用传入的上限。PDF 中每页或每个区域分别使用这份额度。KIE 按单次字段提取计算；
+VQA 使用固定的 1024 Token 上限生成简短答案。模型可以在达到上限之前结束输出。
+
+如果输出被截断，可以在模型上下文允许的范围内增大 `max_tokens`。图像和提示词也
+占用上下文；如果它们与请求的输出额度之和超过服务的上下文上限，则需要降低输出
+额度或缩小输入。
+
+Demo 显示版面检测与 OCR 的运行设备、阶段和页/区域进度。MCP 通过进度通知和
+`runtime_status` 提供同一套任务信息，可以用返回的 `request_id` 查询指定任务。
+详见 [Demo 使用说明](demo/README.md#use) 和 [MCP 配置说明](INSTALL.md#mcp-tasks)。
+
 ## 社区模型转换
 
 感谢社区对xiaomi-ocr-0的支持, [prithivMLmods/Xiaomi-OCR-0-GGUF](https://huggingface.co/prithivMLmods/Xiaomi-OCR-0-GGUF) 和 [xzl01/Xiaomi-OCR-0-GGUF](https://github.com/xzl01/Xiaomi-OCR-0-GGUF) 提供了GGUF量化权重, [ByronLeeee/Xiaomi-OCR-0-Ninfer](https://huggingface.co/ByronLeeee/Xiaomi-OCR-0-Ninfer) 提供 BF16 NInfer 模型包。

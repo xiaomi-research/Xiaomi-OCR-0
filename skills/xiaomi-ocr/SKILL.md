@@ -11,6 +11,12 @@ SGLang, vLLM, or the experimental Ollama backend. The MCP service owns prompts, 
 segmentation, crop processing, concurrency, and output formatting. Call the task tool;
 do not recreate these steps with separate tools or direct model requests.
 
+This repository's MCP sends inference requests to a loopback HTTP endpoint on the
+MCP server host; it does not call Mify. Other installed skills or services may share
+the `xiaomi-ocr` name. Identify the selected MCP from its tool descriptions and
+configuration before describing where files are processed. With a remote MCP,
+`image_path` and `pdf_path` refer to that server's filesystem, not the agent's machine.
+
 ## Set up local inference
 
 ### Choose the inference backend
@@ -137,8 +143,57 @@ Official runtime references:
 - **PDF**: call `ocr_pdf`, choosing page/region by the same document guidance. Prefer local
   file paths over base64 to avoid payload truncation.
 
-Available MCP tools are `ocr_image`, `ocr_pdf`, `kie_image`, and `vqa_image`. Page/region
+Available MCP tools are `ocr_image`, `ocr_pdf`, `kie_image`, `vqa_image`, and `runtime_status`. Page/region
 preprocessing and postprocessing are internal to these calls.
+
+`ocr_image`, `ocr_pdf`, and `kie_image` accept `max_tokens` (default 4096).
+For OCR this is the maximum output per page in page mode or per region in region
+mode. Every region type uses the supplied value, and each PDF page/region receives
+its own budget. KIE applies it to the single extraction. An explicit argument overrides
+the server default from `XIAOMI_OCR_MAX_TOKENS`.
+If output is truncated, increase it only when image/prompt tokens plus the requested
+output fit the inference server's context window. A context-overflow error requires
+a smaller output budget or smaller inputs instead. `vqa_image` uses a fixed 1024-token
+budget for its concise answer.
+
+## Runtime monitoring
+
+Use `runtime_status({})` for a compact overview: resolved devices, active tasks,
+capacity and the three most recent finished tasks. Use `runtime_status({"request_id":"…"})`
+to follow a specific task without probing hardware. IDs appear in progress messages
+and a separate `Runtime:` text block after the OCR result. The first content block
+remains the OCR result; do not include the runtime block in extracted document text.
+The last eight finished summaries remain queryable until evicted or this process
+restarts; an unavailable ID returns `found: false`, not a fabricated completion.
+Use `verbose: true` for active per-page and stage details, and `refresh: true`
+only when fresh device evidence is needed in the overview (otherwise cached for 30s).
+This reports only this server process, not another Demo/MCP process.
+Task devices are the evidence last observed during that task; the overview is the
+place to request fresh device evidence. A recorded cache age is the age at observation.
+Use `display_device` for human-readable placement and `gpu_indices` for the host's
+`nvidia-smi` card numbers. The raw predictor `device` may use a process-local CUDA
+index and must not be substituted for a physical index. UUIDs are not exposed as
+device labels. CPU must be confirmed by runtime metadata; missing NVIDIA tools or
+GPU residency does not prove CPU execution. `CPU + GPU` preserves reported offload.
+It does not load models. Report the runtime's
+resolved device and its source, keeping it separate from the configured/requested
+device. Unloaded or unobservable devices remain unknown. PaddleX may select GPU
+automatically; `XIAOMI_OCR_LAYOUT_DEVICE=cpu` selects CPU layout after an MCP restart.
+Do not change a user's device placement solely because monitoring is requested.
+
+When the client supports MCP progress, include a unique `_meta.progressToken` in
+the tool request metadata. Progress covers layout loading/detection, queue waits,
+inference, PDF pages/regions, and assembly, with waiting heartbeats. Relay these
+updates without inventing a completion percentage. The protocol's `progress` number
+is an increasing event sequence, not a percentage or work count. Use `pages` and
+`regions` in the shared summary for work counts: pages count processed pages,
+including `failed` pages and successful `blank` pages; PDF region totals cover discovered regions until
+`total_is_final` is true. `phase`, `active_pages`, `elapsed_ms`, `last_activity_ms`
+(time since a non-heartbeat event), `error` and `warning` answer what is happening.
+Silence alone does not prove a stalled task. Terminal states distinguish completed,
+partial, failed and cancelled. Structured stderr logs and the
+final result's `_meta.xiaomi_ocr` summary are available even without client progress
+support. `runtime_status` can be queried while another OCR call is running.
 
 ## Output handling
 
@@ -151,3 +206,9 @@ then follow the backend selection and setup authorization rules above. If region
 PaddleX/PaddlePaddle, explain the extra packages and possible layout-weight download, then
 use existing authorization or ask if it does not cover the installation; whole-page mode
 remains available in the meantime.
+
+Demo and MCP execute through the same `execute_tool` and `CallMonitor` implementation.
+Within each service process, at most two tasks run and OCR inference concurrency
+defaults to four (`XIAOMI_OCR_CONCURRENCY`). Busy errors require retrying after a task
+completes. The Demo coalesces image snapshots to two intermediate updates per second
+and polls active PDF jobs once per second; idle pages do not poll hardware.

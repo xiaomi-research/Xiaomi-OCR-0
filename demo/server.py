@@ -19,7 +19,6 @@ import sys
 import threading
 import time
 import uuid
-import urllib.error
 import urllib.request
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -33,56 +32,6 @@ BOOK_TMP = ROOT / "out" / "books"
 
 MAX_BODY = 80 * 1024 * 1024  # 80 MB (PDF books)
 
-DOC_PROMPT = (
-    "Extract all information from the main body of the document image and represent it in markdown format, "
-    "ignoring headers and footers. Tables should be expressed in OTSL format, formulas in the document should "
-    "be represented using LATEX format, and the parsing should be organized according to the reading order."
-)
-
-
-def build_task_prompt(task: str, prompt: str = "", fields: str = "", question: str = "") -> str:
-    """Build constrained prompts for the compact browser demo tasks."""
-    task = (task or "document").strip().lower()
-    if task == "document":
-        return (prompt or DOC_PROMPT).strip()
-    if task == "kie":
-        names = [x.strip() for x in fields.replace("，", "\n").replace(",", "\n").splitlines() if x.strip()]
-        return mcp_pipeline()._schema_prompt(names or None)
-    if task == "vqa":
-        q = question.strip()
-        if not q:
-            raise ValueError("请输入关于图像内容的问题")
-        return q + "\nAnswer the question using a single word or phrase."
-    raise ValueError("task must be document, kie, or vqa")
-
-
-def normalize_image_b64(image_b64: str) -> str:
-    """Apply the MCP's RGB PNG normalization before every page/image inference."""
-    try:
-        normalized = mcp_pipeline()._image_png(base64.b64decode(image_b64, validate=True))
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Cannot decode image: {exc}") from exc
-    return base64.b64encode(normalized).decode()
-
-# ── region-mode prompts (per README contract) ───────────────────────────
-REGION_PROMPTS = {
-    "text": "Extract the text in the image.",
-    "table": "Parse the table in the image into OTSL.",
-    "formula": "Identify the formula in the image and represent it using LATEX format.",
-    "title": "Extract the text in the image.",
-    "figure": "Extract all information from the main body of the document image and represent it in markdown format.",
-}
-# labels we might get from layout → bucket
-LABEL_MAP = {
-    "text": "text", "paragraph": "text", "plain text": "text", "text_line": "text",
-    "title": "title", "header": "title", "section_header": "title",
-    "table": "table", "table_caption": "text",
-    "formula": "formula", "equation": "formula", "isolate_formula": "formula",
-    "figure": "figure", "image": "figure", "figure_caption": "text",
-    "list": "text", "list_item": "text", "caption": "text",
-}
-
-REGION_CONCURRENCY = int(os.environ.get("REGION_CONCURRENCY", "16"))
 LOCAL_MODEL_URL = os.environ.get("XIAOMI_OCR_LOCAL_URL", "http://127.0.0.1:8000/v1").strip()
 LOCAL_MODEL = os.environ.get("XIAOMI_OCR_MODEL", "SeerRay-Lab/Xiaomi-OCR-0").strip()
 
@@ -90,7 +39,7 @@ _MCP_MODULE = None
 _MCP_LOCK = threading.Lock()
 
 
-def mcp_pipeline(model_url: str | None = None, model: str | None = None):
+def mcp_pipeline():
     """Load the shared Skill implementation so Demo and MCP use the same transforms."""
     global _MCP_MODULE
     with _MCP_LOCK:
@@ -158,534 +107,106 @@ def model_health():
             "error": "" if ready else "Configured model is not listed by the inference server"}
 
 
-_LAYOUT_MODEL = None
-_LAYOUT_LOCK = threading.Lock()
-
-
-def call_layout(image_b64: str, mime: str = "image/png") -> list[dict]:
-    """Use the Skill's confidence filter, resize policy, layout model, and reading order."""
-    mcp = mcp_pipeline()
-    raw = base64.b64decode(image_b64)
-    regions = []
-    for r in mcp._layout_regions(raw):
-        if r.get("task_type") in {"skip", "abandon"}:
-            continue
-        cls = r["label"]
-        bucket = r.get("task_type", "text")
-        prompt = mcp.PROMPTS["formula" if bucket == "formula" else "table" if bucket == "table" else "text"]
-        regions.append({"source_region": r, "bbox": r["bbox_2d"], "label": cls, "bucket": bucket,
-                        "score": r["score"], "prompt": prompt})
-    return regions
-
-
-def crop_region(png_bytes: bytes, bbox: list[float], pad: int = 0) -> bytes:
-    import io
-    from PIL import Image
-    return mcp_pipeline()._crop(Image.open(io.BytesIO(png_bytes)), bbox)
-
-
-def ocr_one_region(
-    idx: int, png: bytes, bucket: str, prompt: str,
-    model_url: str, model: str, max_tokens: int, label: str = "text",
-) -> dict:
-    t0 = time.perf_counter()
-    try:
-        mcp = mcp_pipeline(model_url, model)
-        if label != "page_fallback":
-            max_tokens = min(max_tokens, mcp.REGION_MAX_TOKENS.get(bucket, mcp.REGION_MAX_TOKENS["text"]))
-        result = mcp._chat(png, prompt or mcp.PROMPTS.get(bucket, mcp.PROMPTS["text"]),
-                           max_tokens, model_url=model_url, model=model)
-        text = (result.get("text") or "").strip()
-        return {
-            "idx": idx,
-            "ok": True,
-            "bucket": bucket,
-            "text": text,
-            "ms": int((time.perf_counter() - t0) * 1000),
-            "usage": result.get("usage") or {},
-        }
-    except Exception as e:  # noqa: BLE001
-        return {
-            "idx": idx,
-            "ok": False,
-            "bucket": bucket,
-            "text": f"<!-- region {idx} failed: {e} -->",
-            "ms": int((time.perf_counter() - t0) * 1000),
-            "usage": {},
-            "error": str(e),
-        }
-
-
-def assemble_regions(regions: list[dict], results: dict[int, dict]) -> str:
-    """Join region texts in reading order; tables/formulas wrapped."""
-    failed = [r for r in results.values() if not r.get("ok")]
-    if failed:
-        raise RuntimeError(f"{len(failed)} region(s) failed: {failed[0].get('error', 'inference error')}")
-    texts = [results[i]["text"] for i in range(len(regions))]
-    mcp = mcp_pipeline()
-    if len(regions) == 1 and regions[0].get("label") == "page_fallback":
-        return mcp.finalize_document(texts[0])
-    return mcp.assemble_regions([r["source_region"] for r in regions], texts)
-
-
-def parse_image_regions(
-    png_bytes: bytes,
-    model_url: str,
-    model: str,
-    max_tokens: int,
-    concurrency: int = REGION_CONCURRENCY,
-) -> dict:
-    """Layout → crop → concurrent region OCR → assemble."""
-    import base64 as _b64
-    t0 = time.perf_counter()
-    image_b64 = _b64.b64encode(png_bytes).decode()
-
-    # 1) layout
-    regions = call_layout(image_b64, "image/png")
-    if not regions:
-        regions = [{"bbox": [0, 0, 0, 0], "label": "page_fallback", "bucket": "text", "score": 1.0, "prompt": DOC_PROMPT}]
-    t_layout = int((time.perf_counter() - t0) * 1000)
-
-    # 2) crop
-    crops: list[bytes] = []
-    for reg in regions:
-        b = reg["bbox"]
-        if b == [0, 0, 0, 0]:
-            crops.append(png_bytes)
-        else:
-            crops.append(crop_region(png_bytes, b))
-
-    # 3) concurrent OCR
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    results: dict[int, dict] = {}
-    max_conc = max(1, min(int(concurrency), 32))
-    with ThreadPoolExecutor(max_workers=max_conc) as pool:
-        futs = {
-            pool.submit(
-                ocr_one_region, i, crops[i], regions[i]["bucket"], regions[i].get("prompt", ""),
-                model_url, model, max_tokens, regions[i].get("label", "text"),
-            ): i
-            for i in range(len(regions))
-        }
-        for fut in as_completed(futs):
-            r = fut.result()
-            results[r["idx"]] = r
-
-    md = assemble_regions(regions, results)
-    per = [results[i] for i in range(len(regions))]
-    return {
-        "content": md,
-        "regions": [
-            {
-                "bbox": regions[i]["bbox"],
-                "label": regions[i]["label"],
-                "bucket": regions[i].get("bucket"),
-                "ok": per[i]["ok"] if i < len(per) else False,
-                "ms": per[i].get("ms", 0) if i < len(per) else 0,
-                "chars": len(per[i].get("text", "")) if i < len(per) else 0,
-            }
-            for i in range(len(regions))
-        ],
-        "layout_ms": t_layout,
-        "latency_ms": int((time.perf_counter() - t0) * 1000),
-        "concurrency": max_conc,
-        "usage": {
-            "prompt_tokens": sum((per[i].get("usage") or {}).get("prompt_tokens") or 0 for i in range(len(per))),
-            "completion_tokens": sum((per[i].get("usage") or {}).get("completion_tokens") or 0 for i in range(len(per))),
-        },
-        "model": model,
-        "mode": "region",
-    }
-
-
-def stream_image_regions(
-    png_bytes: bytes,
-    model_url: str,
-    model: str,
-    max_tokens: int,
-    concurrency: int = REGION_CONCURRENCY,
-) -> dict:
-    """Layout → crop → concurrent OCR, yielding events as each region completes.
-
-    Yields dicts:
-      {"type":"layout", "count":N, "regions":[{index,bucket,label,...}], "layout_ms":ms}
-      {"type":"region", "index":i, "bucket":.., "text":.., "ok":.., "ms":..}
-      {"type":"done", "latency_ms":.., "usage":{..}, "concurrency":..}
-    """
-    import base64 as _b64
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    t0 = time.perf_counter()
-    image_b64 = _b64.b64encode(png_bytes).decode()
-    regions = call_layout(image_b64, "image/png")
-    if not regions:
-        regions = [{"bbox": [0, 0, 0, 0], "label": "page_fallback", "bucket": "text", "score": 1.0, "prompt": DOC_PROMPT}]
-    t_layout = int((time.perf_counter() - t0) * 1000)
-
-    yield {
-        "type": "layout",
-        "count": len(regions),
-        "regions": [
-            {"index": i, "bucket": r.get("bucket", "text"),
-             "label": r.get("label", ""), "bbox": r["bbox"]}
-            for i, r in enumerate(regions)
-        ],
-        "layout_ms": t_layout,
-    }
-
-    crops = [
-        png_bytes if r["bbox"] == [0, 0, 0, 0] else crop_region(png_bytes, r["bbox"])
-        for r in regions
-    ]
-    results: dict[int, dict] = {}
-    max_conc = max(1, min(int(concurrency), 32))
-    with ThreadPoolExecutor(max_workers=max_conc) as pool:
-        futs = {
-            pool.submit(
-                ocr_one_region, i, crops[i], regions[i]["bucket"], regions[i].get("prompt", ""),
-                model_url, model, max_tokens, regions[i].get("label", "text"),
-            ): i
-            for i in range(len(regions))
-        }
-        for fut in as_completed(futs):
-            r = fut.result()
-            results[r["idx"]] = r
-            yield {
-                "type": "region",
-                "index": r["idx"],
-                "bucket": r.get("bucket", "text"),
-                "ok": r.get("ok", False),
-                "ms": r.get("ms", 0),
-                "text": r.get("text", ""),
-            }
-
-    per = [results[i] for i in range(len(regions))]
-    yield {
-        "type": "done",
-        "content": assemble_regions(regions, results),
-        "latency_ms": int((time.perf_counter() - t0) * 1000),
-        "layout_ms": t_layout,
-        "concurrency": max_conc,
-        "usage": {
-            "prompt_tokens": sum((per[i].get("usage") or {}).get("prompt_tokens") or 0 for i in range(len(per))),
-            "completion_tokens": sum((per[i].get("usage") or {}).get("completion_tokens") or 0 for i in range(len(per))),
-        },
-    }
-
-# ── in-memory book jobs ─────────────────────────────────────────────────
+# The Demo owns HTTP and job storage only. Inference, counters and device
+# inspection all run in the same execute_tool() used by the MCP transport.
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
 
-def job_get(jid: str) -> dict | None:
+def job_get(jid):
     with JOBS_LOCK:
-        return JOBS.get(jid)
+        job = JOBS.get(jid)
+        return dict(job) if job else None
 
 
-def job_update(jid: str, **kw) -> None:
+def job_update(jid, **values):
     with JOBS_LOCK:
-        JOBS.setdefault(jid, {}).update(kw)
+        JOBS.setdefault(jid, {}).update(values)
 
 
-def build_user_content(image_b64: str, mime: str, prompt: str) -> list:
-    return [
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{image_b64}"},
-        },
-        {"type": "text", "text": prompt},
-    ]
+def demo_arguments(req, mode="page"):
+    task = req.get("task", "document")
+    if not req.get("image_base64"):
+        raise ValueError("image is required")
+    args = {"image_base64": req["image_base64"], "max_tokens": req.get("max_tokens", 4096),
+            "model_url": LOCAL_MODEL_URL, "model": LOCAL_MODEL, "temperature": req.get("temperature", 0.0)}
+    if task == "kie":
+        args["fields"] = [x.strip() for x in req.get("fields", "").replace("，", ",").replace("\n", ",").split(",") if x.strip()]
+        return "kie_image", args
+    if task == "vqa":
+        if not req.get("question", "").strip():
+            raise ValueError("请输入关于图像内容的问题")
+        args["question"] = req["question"]
+        return "vqa_image", args
+    args.update(mode=mode, prompt=req.get("prompt"), concurrency=req.get("concurrency"))
+    return "ocr_image", args
 
 
-def call_local_model(
-    model_url: str,
-    model: str,
-    image_b64: str,
-    mime: str,
-    prompt: str,
-    temperature: float,
-    max_tokens: int,
-) -> dict:
-    base = model_url.rstrip("/")
-    parsed_base = urllib.parse.urlparse(base)
-    if parsed_base.scheme != "http" or parsed_base.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise RuntimeError("Inference must run locally; configure XIAOMI_OCR_LOCAL_URL with a loopback address.")
-    if not base.endswith("/chat/completions"):
-        if base.endswith("/v1"):
-            url = base + "/chat/completions"
-        else:
-            url = base + "/v1/chat/completions"
+def demo_result(outcome):
+    if not outcome["ok"]:
+        return {"error": outcome["error"], "monitor": outcome.get("monitor")}
+    result, monitor = outcome["result"], outcome["monitor"]
+    if "markdown" in result:
+        content = result["markdown"]
+    elif "answer" in result:
+        content = result["answer"]
     else:
-        url = base
+        content = json.dumps(result["json"] if result.get("json") is not None else result, ensure_ascii=False, indent=2)
+    return {"content": content, "model": LOCAL_MODEL, "usage": result.get("usage", {}),
+            "latency_ms": monitor["elapsed_ms"], "monitor": monitor,
+            "regions": result.get("region_results", []), "layout_ms": result.get("layout_ms", 0),
+            "concurrency": result.get("concurrency", mcp_pipeline().CONCURRENCY),
+            "pages": result.get("pages"), "blank_pages": result.get("blank_pages", 0), "warning": result.get("warning", "")}
 
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": build_user_content(image_b64, mime, prompt),
-            }
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": False,
-        "top_p": 0.8, "presence_penalty": 0.0, "repetition_penalty": 1.0,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    t0 = time.perf_counter()
+
+def run_book_job(jid, pdf_path, max_tokens, max_pages, dpi, concurrency, prompt, mode):
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            raw = resp.read()
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        if e.code == 400 and "maximum context length" in body.lower():
-            raise RuntimeError(
-                "The image/prompt plus requested output exceeds the model context. "
-                "Reduce max_tokens and retry; 16384 is only the output ceiling."
-            ) from e
-        raise RuntimeError(f"HTTP {e.code}: {body[:2000]}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Connection failed: {e.reason}") from e
-
-    latency_ms = int((time.perf_counter() - t0) * 1000)
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid response from local model (HTTP {status}): {raw[:500]!r}") from e
-
-    usage = parsed.get("usage") or {}
-    choices = parsed.get("choices") or []
-    content = ""
-    if choices:
-        msg = choices[0].get("message") or {}
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            content = "".join(
-                p.get("text", "") if isinstance(p, dict) else str(p) for p in content
-            )
-
-    if not content.strip():
-        raise RuntimeError("Local model returned an empty response")
-    if choices[0].get("finish_reason") == "length":
-        raise RuntimeError("Model output was truncated; increase the output/context budget")
-    return {
-        "content": content,
-        "model": parsed.get("model", model),
-        "usage": usage,
-        "latency_ms": latency_ms,
-        "raw": parsed,
-    }
-
-
-def ocr_png_bytes(png: bytes, model_url: str, model: str, max_tokens: int) -> tuple[str, int, dict]:
-    b64 = base64.b64encode(png).decode()
-    return (
-        call_local_model(
-            model_url=model_url,
-            model=model,
-            image_b64=b64,
-            mime="image/png",
-            prompt=DOC_PROMPT,
-            temperature=0.0,
-            max_tokens=max_tokens,
-        )["content"],
-        0,
-        {},
-    )
-
-
-def merge_usage(a, b):
-    result = dict(a)
-    for key, value in b.items():
-        if isinstance(value, dict):
-            result[key] = merge_usage(result.get(key) if isinstance(result.get(key), dict) else {}, value)
-        elif isinstance(value, (int, float)):
-            previous = result.get(key)
-            result[key] = (previous if isinstance(previous, (int, float)) else 0) + value
-    return result
-
-
-def run_book_job(jid, *args, **kwargs):
-    try:
-        _run_book_job(jid, *args, **kwargs)
+        _run_book_job(jid, pdf_path, max_tokens, max_pages, dpi, concurrency, prompt, mode)
     except Exception as exc:
         job_update(jid, status="error", error=str(exc))
 
 
-def _run_book_job(jid: str, pdf_path: Path, model_url: str, model: str,
-                 max_tokens: int, max_pages: int | None, dpi: int,
-                 title: str | None = None, concurrency: int = 4,
-                 prompt: str = DOC_PROMPT, mode: str = "page") -> None:
-    try:
-        import pypdfium2 as pdfium
-    except ImportError:
-        job_update(jid, status="error", error="pypdfium2 not installed on server")
-        return
-    try:
-        from PIL import Image
-    except ImportError:
-        job_update(jid, status="error", error="Pillow not installed on server; install it with python3 -m pip install Pillow")
-        return
-
-    try:
-        with mcp_pipeline()._PDF_LOCK, pdfium.PdfDocument(str(pdf_path)) as doc:
-            total_pdf = len(doc)
-    except Exception as e:  # noqa: BLE001
-        job_update(jid, status="error", error=f"PDF open failed: {e}")
-        return
-
-    total = total_pdf if max_pages is None else min(total_pdf, max_pages)
+def _run_book_job(jid, pdf_path, max_tokens, max_pages, dpi, concurrency, prompt, mode):
     pages_dir = BOOK_TMP / jid / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
-    job_update(
-        jid,
-        status="running",
-        total=total,
-        total_pdf=total_pdf,
-        done=0,
-        current=0,
-        pages_ok=0,
-        page_log=[],
-        pages_dir=str(pages_dir),
-        concurrency=max(1, concurrency),
-    )
+    job_update(jid, pages_dir=str(pages_dir), status="running", page_log=[])
 
-    scale = dpi / 72.0
-    t_all = time.perf_counter()
-    import io
+    def observe(state):
+        counts = state["progress_counts"]
+        rendered = counts.get("pipeline/rendered_pages", {})
+        recognized = counts.get("pipeline/recognized_pages", {})
+        phase = "render" if any(s["stage"] == "render_pdf" for s in state["active_stages"]) else "ocr"
+        job_update(jid, monitor=state, total=rendered.get("total", 0), done=recognized.get("completed", 0),
+                   phase=phase, elapsed_ms=state["elapsed_ms"])
 
-    # ── Phase 1: render all pages locally (fast) ──
-    page_pngs: list[bytes] = []
-    rendered_pages = mcp_pipeline()._render_pdf(pdf_path.read_bytes(), max_pages, dpi)
-    for i in range(total):
-        job = job_get(jid) or {}
-        if job.get("cancel"):
-            job_update(jid, status="cancelled")
-            return
-        job_update(jid, current=i + 1, phase="render",
-                   phase_label=f"渲染 {i + 1}/{total}")
-        page_png = pages_dir / f"p{i + 1:04d}.png"
-        page_png.write_bytes(rendered_pages[i])
-        page_pngs.append(rendered_pages[i])
+    def on_render(page, png):
+        (pages_dir / f"p{page:04d}.png").write_bytes(png)
 
-    if job_get(jid, ).get("cancel"):
-        job_update(jid, status="cancelled")
-        return
+    def on_page(page, result):
+        job = job_get(jid)
+        log = job.get("page_log", []) + [{"page": page, "ok": result["ok"], "ms": result["ms"],
+                                         "chars": len(result["text"]), "error": result["error"],
+                                         "img": f"/api/book/{jid}/page/{page}"}]
+        job_update(jid, page_log=sorted(log, key=lambda row: row["page"]),
+                   usage=mcp_pipeline().merge_usage(job.get("usage", {}), result["usage"]))
 
-    # ── Phase 2: parallel OCR (bounded by service concurrency limit) ──
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    results: dict[int, dict] = {}
-    results_lock = threading.Lock()
-    done_count = 0
-
-    def ocr_one(idx: int) -> tuple[int, dict]:
-        if (job_get(jid) or {}).get("cancel"):
-            return idx, {"ok": False, "text": "", "ms": 0, "usage": {}, "error": "cancelled"}
-        t0 = time.perf_counter()
-        try:
-            if mode == "region":
-                result = parse_image_regions(
-                    png_bytes=page_pngs[idx], model_url=model_url, model=model,
-                    max_tokens=max_tokens, concurrency=min(REGION_CONCURRENCY, 8),
-                )
-            else:
-                result = call_local_model(
-                    model_url=model_url,
-                    model=model,
-                    image_b64=base64.b64encode(page_pngs[idx]).decode(),
-                    mime="image/png",
-                    prompt=prompt,
-                    temperature=0.0,
-                    max_tokens=max_tokens,
-                )
-            text = (result.get("content") or "").strip()
-            if mode == "page":
-                text = mcp_pipeline().finalize_document(text)
-            lat = result.get("latency_ms") or int((time.perf_counter() - t0) * 1000)
-            return idx, {
-                "ok": True,
-                "text": text,
-                "ms": lat,
-                "usage": result.get("usage") or {},
-                "error": "",
-            }
-        except Exception as e:  # noqa: BLE001
-            return idx, {
-                "ok": False,
-                "text": f"<!-- page {idx + 1} OCR failed: {e} -->",
-                "ms": int((time.perf_counter() - t0) * 1000),
-                "usage": {},
-                "error": str(e),
-            }
-
-    job_update(jid, phase="ocr", current=0, phase_label=f"OCR 并发 {concurrency}")
-
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        futures = [pool.submit(ocr_one, i) for i in range(total)]
-        for fut in as_completed(futures):
-            idx, r = fut.result()
-            with results_lock:
-                results[idx] = r
-                done_count += 1
-                cur = job_get(jid) or {}
-                page_log = list(cur.get("page_log") or [])
-                old_usage = cur.get("usage") or {}
-                new_usage = r.get("usage") or {}
-                usage_totals = merge_usage(old_usage, new_usage)
-                page_log.append({
-                    "page": idx + 1,
-                    "ok": r["ok"],
-                    "ms": r["ms"],
-                    "chars": len(r["text"]),
-                    "error": r["error"],
-                    "img": f"/api/book/{jid}/page/{idx + 1}",
-                })
-                # keep log sorted by page for stable UI
-                page_log.sort(key=lambda x: x["page"])
-                job_update(
-                    jid,
-                    done=done_count,
-                    current=idx + 1,
-                    phase="ocr",
-                    phase_label=f"OCR {done_count}/{total}",
-                    pages_ok=(cur.get("pages_ok") or 0) + (1 if r["ok"] else 0),
-                    last_ms=r["ms"],
-                    usage=usage_totals,
-                    page_log=page_log,
-                    elapsed_ms=int((time.perf_counter() - t_all) * 1000),
-                )
-
+    args = {"pdf_path": str(pdf_path), "max_tokens": max_tokens, "max_pages": max_pages, "dpi": dpi,
+            "concurrency": concurrency, "prompt": prompt, "mode": mode, "keep_partial": True,
+            "model_url": LOCAL_MODEL_URL, "model": LOCAL_MODEL}
+    outcome = mcp_pipeline().execute_tool("ocr_pdf", args, observe=observe,
+                                         cancelled=lambda: (job_get(jid) or {}).get("cancel", False),
+                                         on_render=on_render, on_page=on_page)
     if (job_get(jid) or {}).get("cancel"):
-        job_update(jid, status="cancelled")
-        return
-
-    # ── Assemble in page order ──
-    parts: list[str] = []
-    for i in range(total):
-        r = results.get(i) or {"ok": False, "text": f"<!-- page {i + 1} missing -->", "ms": 0, "usage": {}, "error": "missing"}
-        parts.append(f"<!-- page {i + 1} -->\n\n{r['text']}")
-
-    md = "\n\n---\n\n".join(parts)
-    out_path = BOOK_TMP / f"{jid}.md"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(md, encoding="utf-8")
-    job_update(
-        jid,
-        status="error" if any(not r["ok"] for r in results.values()) else "done",
-        error="One or more PDF pages failed; partial output is retained." if any(not r["ok"] for r in results.values()) else "",
-        markdown=md,
-        result_path=str(out_path),
-        elapsed_ms=int((time.perf_counter() - t_all) * 1000),
-        phase_label="完成",
-    )
+        job_update(jid, status="cancelled", monitor=outcome.get("monitor"))
+    elif outcome["ok"]:
+        result = demo_result(outcome)
+        out_path = BOOK_TMP / f"{jid}.md"
+        out_path.write_text(result["content"], encoding="utf-8")
+        job_update(jid, status="error" if result["warning"] else "done", error=result["warning"],
+                   markdown=result["content"], result_path=str(out_path), usage=result["usage"],
+                   elapsed_ms=result["latency_ms"], monitor=result["monitor"])
+    else:
+        job_update(jid, status="error", error=outcome["error"], monitor=outcome.get("monitor"))
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -704,6 +225,8 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 health.update(ready=False, model=LOCAL_MODEL, error=str(exc))
             return self._json(200, health)
+        if path == "/api/runtime":
+            return self._json(200, mcp_pipeline().runtime_status(LOCAL_MODEL_URL, LOCAL_MODEL, verbose=True))
         if path in ("/", "/index.html"):
             self.path = "/index.html"
             return super().do_GET()
@@ -806,13 +329,13 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/export":
             return self._handle_export()
         if path == "/api/ocr":
-            return self._handle_ocr()
+            return self._handle_run()
         if path == "/api/ocr/stream":
-            return self._handle_ocr_stream()
+            return self._handle_run(stream=True)
         if path == "/api/parse/regions":
-            return self._handle_parse_regions()
+            return self._handle_run(mode="region")
         if path == "/api/parse/regions/stream":
-            return self._handle_parse_regions_stream()
+            return self._handle_run(stream=True, mode="region")
         if path == "/api/book":
             return self._handle_book_start()
         if path.startswith("/api/book/") and path.endswith("/cancel"):
@@ -861,325 +384,70 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(400, {"error": str(exc)})
             return None
 
-    def _handle_ocr(self):
+    def _handle_run(self, stream=False, mode="page"):
         req = self._read_json()
         if req is None:
             return
-
-        model_url = LOCAL_MODEL_URL
-        model = LOCAL_MODEL
         try:
-            prompt = build_task_prompt(req.get("task", "document"), req.get("prompt", ""),
-                                       req.get("fields", ""), req.get("question", ""))
+            name, args = demo_arguments(req, mode)
         except ValueError as exc:
-            self._json(400, {"error": str(exc)})
-            return
-        image_b64 = req.get("image_base64") or ""
-        mime = req.get("image_mime") or "image/png"
-        temperature = float(req.get("temperature") or 0.0)
-        max_tokens = int(req.get("max_tokens") or 4096)
+            return self._json(400, {"error": str(exc)})
+        if not stream:
+            outcome = mcp_pipeline().execute_tool(name, args)
+            return self._json(200 if outcome["ok"] else 502, demo_result(outcome))
 
-        if image_b64.startswith("data:"):
-            try:
-                header, b64 = image_b64.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0] or mime
-                image_b64 = b64
-            except ValueError:
-                self._json(400, {"error": "malformed data URL"})
-                return
-
-        if not image_b64:
-            self._json(400, {"error": "image is required"})
-            return
-        if not prompt:
-            self._json(400, {"error": "prompt is required"})
-            return
-        try:
-            image_b64 = normalize_image_b64(image_b64)
-            mime = "image/png"
-        except ValueError as exc:
-            self._json(400, {"error": str(exc)})
-            return
-
-        try:
-            result = call_local_model(
-                model_url=model_url,
-                    model=model,
-                image_b64=image_b64,
-                mime=mime,
-                prompt=prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        except Exception as e:  # noqa: BLE001
-            self._json(502, {"error": str(e)})
-            return
-
-        if req.get("task", "document") == "document":
-            result["content"] = mcp_pipeline().finalize_document(result["content"])
-        self._json(200, result)
-
-    def _handle_ocr_stream(self):
-        """Relay token output from the local model process.
-
-        Request JSON same as /api/ocr. Response: text/event-stream with
-        event: delta   data: {"t": "<token>"}
-        event: done    data: {"latency_ms":..., "usage":{...}, "model":...}
-        event: error   data: {"error":"..."}
-        """
-        req = self._read_json()
-        if req is None:
-            return
-
-        model_url = LOCAL_MODEL_URL
-        model = LOCAL_MODEL
-        try:
-            prompt = build_task_prompt(req.get("task", "document"), req.get("prompt", ""),
-                                       req.get("fields", ""), req.get("question", ""))
-        except ValueError as exc:
-            self._json(400, {"error": str(exc)})
-            return
-        image_b64 = req.get("image_base64") or ""
-        mime = req.get("image_mime") or "image/png"
-        temperature = float(req.get("temperature") or 0.0)
-        max_tokens = int(req.get("max_tokens") or 4096)
-
-        if image_b64.startswith("data:"):
-            try:
-                header, b64 = image_b64.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0] or mime
-                image_b64 = b64
-            except ValueError:
-                self._json(400, {"error": "malformed data URL"})
-                return
-        if not image_b64 or not prompt:
-            self._json(400, {"error": "image / prompt required"})
-            return
-        try:
-            image_b64 = normalize_image_b64(image_b64)
-            mime = "image/png"
-        except ValueError as exc:
-            self._json(400, {"error": str(exc)})
-            return
-
-        base = model_url.rstrip("/")
-        parsed_base = urllib.parse.urlparse(base)
-        if parsed_base.scheme != "http" or parsed_base.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            self._json(400, {"error": "The demo only accepts a local model listener."})
-            return
-        if not base.endswith("/chat/completions"):
-            url = base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
-        else:
-            url = base
-
-        payload = {
-            "model": model,
-            "messages": [{
-                "role": "user",
-                "content": build_user_content(image_b64, mime, prompt),
-            }],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-            "top_p": 0.8, "presence_penalty": 0.0, "repetition_penalty": 1.0,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "stream_options": {"include_usage": True},
-        }
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-        t0 = time.perf_counter()
-        try:
-            upstream_req = urllib.request.Request(
-                url, data=json.dumps(payload).encode("utf-8"),
-                headers=headers, method="POST",
-            )
-            upstream = urllib.request.urlopen(upstream_req, timeout=300)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            self._json(502, {"error": f"HTTP {e.code}: {body[:800]}"})
-            return
-        except Exception as e:  # noqa: BLE001
-            self._json(502, {"error": str(e)})
-            return
-
-        # start SSE response
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        self.connection.settimeout(10)
+        condition, finished, disconnected = threading.Condition(), threading.Event(), threading.Event()
+        pending, outcome = None, None
 
-        def sse(event: str, data: dict) -> None:
-            chunk = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        def observe(state):
+            nonlocal pending
+            with condition:
+                pending = state  # One latest snapshot: a slow browser cannot grow a queue.
+                condition.notify()
+
+        def run():
+            nonlocal outcome
             try:
-                self.wfile.write(chunk.encode("utf-8"))
-                self.wfile.flush()
-            except BrokenPipeError:
-                raise
+                outcome = mcp_pipeline().execute_tool(name, args, observe=observe, cancelled=disconnected.is_set)
+            finally:
+                finished.set()
+                with condition:
+                    condition.notify()
 
-        usage: dict = {}
-        full_text = ""
-        finish_reason = None
+        def send(event, data):
+            self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+            self.wfile.flush()
+
+        threading.Thread(target=run, daemon=True).start()
         try:
-            for raw_line in upstream:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
+            while True:
+                with condition:
+                    if pending is None and not finished.is_set():
+                        condition.wait(5)
+                    state, pending = pending, None
+                if state and not finished.is_set():
+                    send("progress", state)
+                if finished.is_set():
+                    result = demo_result(outcome)
+                    if result.get("monitor"):
+                        send("progress", result["monitor"])
+                    send("done" if outcome["ok"] else "error", result)
                     break
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("usage"):
-                    usage = obj["usage"]
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                finish_reason = choices[0].get("finish_reason") or finish_reason
-                delta = (choices[0].get("delta") or {}).get("content") or ""
-                if delta:
-                    full_text += delta
-                    sse("delta", {"t": delta})
-            if finish_reason is None:
-                raise RuntimeError("Inference stream ended without a completion marker; retry the request")
-            if finish_reason == "length" or not full_text.strip():
-                raise RuntimeError("Model output was truncated or empty")
-            sse("done", {
-                "content": mcp_pipeline().finalize_document(full_text) if req.get("task", "document") == "document" else full_text,
-                "latency_ms": int((time.perf_counter() - t0) * 1000),
-                "usage": usage,
-                "model": model,
-            })
-        except BrokenPipeError:
-            pass
-        except Exception as e:  # noqa: BLE001
-            try:
-                sse("error", {"error": str(e)})
-            except Exception:  # noqa: BLE001
-                pass
-        finally:
-            try:
-                upstream.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _handle_parse_regions(self):
-        """POST /api/parse/regions — layout → crop → concurrent region OCR.
-
-        Body: {image_base64, max_tokens?, concurrency?}
-        """
-        req = self._read_json()
-        if req is None:
-            return
-        model_url = LOCAL_MODEL_URL
-        model = LOCAL_MODEL
-        max_tokens = int(req.get("max_tokens") or 2048)
-        concurrency = int(req.get("concurrency") or REGION_CONCURRENCY)
-        image_b64 = req.get("image_base64") or ""
-        mime = req.get("image_mime") or "image/png"
-
-        if image_b64.startswith("data:"):
-            try:
-                header, b64 = image_b64.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0] or mime
-                image_b64 = b64
-            except ValueError:
-                self._json(400, {"error": "malformed data URL"})
-                return
-        if not image_b64:
-            self._json(400, {"error": "image required"})
-            return
-
-        try:
-            png_bytes = base64.b64decode(normalize_image_b64(image_b64))
-            result = parse_image_regions(
-                png_bytes=png_bytes,
-                model_url=model_url,
-                    model=model,
-                max_tokens=max_tokens,
-                concurrency=concurrency,
-            )
-        except Exception as e:  # noqa: BLE001
-            self._json(502, {"error": str(e)})
-            return
-        self._json(200, result)
-
-    def _handle_parse_regions_stream(self):
-        """POST /api/parse/regions/stream — SSE: layout event, then one event per region as it finishes.
-
-        Same body as /api/parse/regions. Events:
-          event: layout  data: {"count":N,"regions":[...]}
-          event: region  data: {"index":i,"bucket":..,"ok":..,"ms":..,"text":..}
-          event: done    data: {"latency_ms":..,"usage":{..},"concurrency":..}
-        """
-        req = self._read_json()
-        if req is None:
-            return
-        model_url = LOCAL_MODEL_URL
-        model = LOCAL_MODEL
-        max_tokens = int(req.get("max_tokens") or 2048)
-        concurrency = int(req.get("concurrency") or REGION_CONCURRENCY)
-        image_b64 = req.get("image_base64") or ""
-        mime = req.get("image_mime") or "image/png"
-
-        if image_b64.startswith("data:"):
-            try:
-                header, b64 = image_b64.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0] or mime
-                image_b64 = b64
-            except ValueError:
-                self._json(400, {"error": "malformed data URL"})
-                return
-        if not image_b64:
-            self._json(400, {"error": "image required"})
-            return
-
-        try:
-            png_bytes = base64.b64decode(normalize_image_b64(image_b64))
-        except Exception as e:  # noqa: BLE001
-            self._json(502, {"error": str(e)})
-            return
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        def sse(event: str, data: dict) -> None:
-            chunk = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-            try:
-                self.wfile.write(chunk.encode("utf-8"))
-                self.wfile.flush()
-            except BrokenPipeError:
-                raise
-
-        try:
-            for ev in stream_image_regions(
-                png_bytes=png_bytes,
-                model_url=model_url,
-                    model=model,
-                max_tokens=max_tokens,
-                concurrency=concurrency,
-            ):
-                sse(ev["type"], {k: v for k, v in ev.items() if k != "type"})
-        except BrokenPipeError:
-            return
-        except Exception as e:  # noqa: BLE001
-            try:
-                sse("error", {"error": str(e)})
-            except Exception:  # noqa: BLE001
-                pass
+                finished.wait(.5)  # At most two intermediate browser updates per second.
+        except (OSError, TimeoutError):
+            disconnected.set()
 
     def _handle_book_start(self):
         req = self._read_json()
         if req is None:
             return
 
-        model_url = LOCAL_MODEL_URL
         model = LOCAL_MODEL
         max_tokens = int(req.get("max_tokens") or 4096)
         max_pages = req.get("max_pages")
@@ -1189,14 +457,9 @@ class Handler(SimpleHTTPRequestHandler):
         if mode not in {"page", "region"}:
             self._json(400, {"error": "PDF mode must be page or region"})
             return
-        try:
-            prompt = build_task_prompt("document", req.get("prompt", ""))
-        except ValueError as exc:
-            self._json(400, {"error": str(exc)})
-            return
+        prompt = req.get("prompt")
         # Bound nested region OCR fan-out as well as page-level concurrency.
-        concurrency = int(req.get("concurrency") or (2 if mode == "region" else 4))
-        concurrency = max(1, min(8 if mode == "region" else 4, concurrency))
+        concurrency = min(mcp_pipeline().CONCURRENCY, int(req.get("concurrency") or 2))
         sample = (req.get("sample") or "").strip()
         pdf_b64 = req.get("pdf_base64") or ""
         pdf_name = (req.get("pdf_name") or "book.pdf").strip()
@@ -1244,7 +507,7 @@ class Handler(SimpleHTTPRequestHandler):
         )
         th = threading.Thread(
             target=run_book_job,
-            args=(jid, pdf_path, model_url, model, max_tokens, max_pages, dpi, None, concurrency, prompt, mode),
+            args=(jid, pdf_path, max_tokens, max_pages, dpi, concurrency, prompt, mode),
             daemon=True,
         )
         th.start()
