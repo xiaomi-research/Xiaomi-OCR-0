@@ -78,13 +78,14 @@ bash skills/xiaomi-ocr/install.sh --agent=codex
 For **Ollama**:
 
 ```bash
+XIAOMI_OCR_BACKEND=ollama \
 XIAOMI_OCR_LOCAL_URL=http://127.0.0.1:11434/v1 \
 XIAOMI_OCR_MODEL=longwayxu/xiaomi-ocr-0:bf16 \
 bash skills/xiaomi-ocr/install.sh --agent=codex
 ```
 
-The installer saves the URL and model in the MCP configuration. Pass both explicitly:
-the current installer does not use `XIAOMI_OCR_BACKEND` to select the URL or model.
+The installer saves the backend, URL and model in the MCP configuration. Pass the
+URL and model explicitly; `XIAOMI_OCR_BACKEND` selects the transport, not those values.
 
 After the user authorizes this step, the installer creates a private Python environment,
 installs the packages in `skills/xiaomi-ocr/requirements.txt`, and writes `mcp-config.json`. With `--agent=codex` it also registers the
@@ -131,6 +132,7 @@ or irregular layouts: an incorrect region split can lose context and compound er
 - `ocr_image` and `ocr_pdf`: document parsing in `page` or `region` mode.
 - `kie_image`: key-value extraction as JSON; optionally supply desired field names.
 - `vqa_image`: answer a question about the document image.
+- `runtime_status`: inspect layout/OCR devices and active calls without loading models.
 
 Image/PDF preprocessing, prompts, layout handling, concurrency, and output formatting stay
 inside the MCP tools. Model prompts request OTSL; the tools convert tables into HTML within Markdown.
@@ -140,14 +142,83 @@ Set `XIAOMI_OCR_LAYOUT_MODEL_DIR` to reuse PaddleX-format layout weights and
 agent workflow and [`skills/xiaomi-ocr/scripts/otsl_convert.py`](skills/xiaomi-ocr/scripts/otsl_convert.py)
 for optional offline conversion; it is not a required agent step.
 
+### Runtime placement and progress
+
+Call `runtime_status` to inspect **both** PP-DocLayoutV3 and Xiaomi-OCR-0. The layout
+entry separates `requested_device` (`auto` when unset) from the loaded predictor's
+resolved `device`, including CPU fallback. PaddleX may select a GPU automatically;
+set `XIAOMI_OCR_LAYOUT_DEVICE=cpu` in the MCP environment and restart MCP if CPU layout
+is preferred. An unloaded layout model reports `device: unknown`; inspection does
+not import Paddle or download weights.
+
+OCR inspection first checks `/v1/models` to identify the configured model's backend,
+then reads its device metadata. When unavailable, a local NVIDIA fallback matches
+the listener/worker PIDs obtained with `lsof`/`ps` to `nvidia-smi` GPU residency.
+Results are cached for 30 seconds across OCR calls; explicit `runtime_status`
+requests use the same cache unless `refresh: true` is requested. Missing metadata or tools produce `unknown` with the error
+source. Server-local GPU indices and memory residency are labeled; residency is
+not utilization or a measurement of CPU offload. Probes have short timeouts and do
+not start or reconfigure inference services.
+
+Clients can request progress on an OCR tool call using MCP request metadata:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ocr_pdf","arguments":{"pdf_path":"/absolute/path/document.pdf","mode":"region"},"_meta":{"progressToken":"ocr-1"}}}
+```
+
+Progress messages cover preparation, PDF rendering, layout loading/detection,
+inference queueing, page/region completion, and assembly. While waiting,
+a heartbeat every five seconds lists active stages and elapsed time. Generated
+text is not logged. Page/region counts are reported when known; `progress` is a
+monotonic event count, not an estimated token percentage. Display depends on the
+MCP client. Without a progress token, structured
+events remain available on stderr and the OCR result remains the normal text output.
+
+`runtime_status` and `ping` remain responsive during OCR. Final tool results include
+a `xiaomi_ocr` summary in `_meta`, with devices and completion counters; stage start/end
+events include elapsed time. All concurrent page,
+region, and tool requests share `XIAOMI_OCR_CONCURRENCY` inference slots (default 4) within each service process. The shared execution entry
+admits at most two active tasks; excess tasks return an explicit busy error. Demo and
+MCP use the same implementation; separately launched processes have separate limits.
+
+The Demo displays these same snapshots, including both component devices, stages,
+page counts and per-page region counts. Image progress is coalesced to at most two
+intermediate updates per second; PDF status polling is once per second while active.
+Idle pages do not poll devices. See [Demo monitoring](demo/README.md#use).
+
 ## Batch evaluation
 
 The restored [pipeline commands](evaluation_pipeline/README.md) and [postprocessing modules](postprocess/README.md) share the document assembly used by MCP and the Demo. Install `requirements.txt` for batch inference.
 
 ### Output budget and existing Codex entries
 
-The MCP default output budget is 4096 tokens, leaving room for image/prompt tokens
-inside the documented 16384-token context. Override `XIAOMI_OCR_MAX_TOKENS` only
-when the model context can accommodate both the input and requested output.
+`ocr_image`, `ocr_pdf`, and `kie_image` accept a per-call `max_tokens` argument.
+The default is 4096. Page mode applies it to each page; Region mode applies it to
+every region type. Each PDF page/region receives its own budget. KIE applies it to
+one extraction; `vqa_image` uses a fixed 1024-token budget for concise answers.
+
+For example, call `ocr_pdf` with these arguments to allow up to 8192 tokens per region:
+
+```json
+{"pdf_path": "/absolute/path/document.pdf", "mode": "region", "max_tokens": 8192}
+```
+
+To change the MCP default, set `XIAOMI_OCR_MAX_TOKENS` in the MCP server's configured
+environment and restart that server. An explicit tool argument takes precedence.
+The Demo uses its own **Settings → Maximum output tokens** value, initially 4096.
+
+Increase the budget for truncated output only when image/prompt tokens plus the
+requested output fit the model context. For context-overflow errors, reduce the
+output budget or input size. Raising the limit allows longer output; it does not
+force the model to generate that many tokens or change the inference concurrency.
+
 Re-registering a previous HTTP `xiaomi-ocr` entry replaces its transport with stdio;
 other MCP servers, custom environment variables, and tool preferences are preserved.
+
+`runtime_status({})` returns a compact process-local overview. Use `request_id` from
+a progress notification or the final `Runtime:` content block to query one task
+without hardware probes. The last eight completed task summaries are retained in
+memory (overview lists three); unknown/evicted IDs return `found: false`. Use
+`verbose: true` for active per-page/stage details. `progress` is an event sequence,
+not percent complete. The first result content block remains OCR output; the separate
+runtime block is status metadata for the agent, not extracted document content.

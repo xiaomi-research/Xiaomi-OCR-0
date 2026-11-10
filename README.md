@@ -181,6 +181,31 @@ official guide. PP-DocLayoutV3 weights download on first use if not cached. For 
 set `XIAOMI_OCR_LAYOUT_DEVICE=cpu` in the Demo or MCP environment. Whole-page OCR, KIE and
 VQA work without these extra dependencies.
 
+## Output length and task status
+
+The default output limit for document parsing and KIE is **4096 tokens**. In the
+Demo, open **Settings → Maximum output tokens**, enter a value, and save before
+running the task. With MCP, pass `max_tokens` to `ocr_image`, `ocr_pdf`, or `kie_image`.
+For example, these `ocr_pdf` arguments allow up to 8192 output tokens per region:
+
+```json
+{"pdf_path": "/absolute/path/document.pdf", "mode": "region", "max_tokens": 8192}
+```
+
+Page mode applies the limit to each page; Region mode applies it to each detected
+region, including text, tables, and formulas. Each PDF page/region gets its own
+budget. KIE applies it to one extraction; VQA uses a fixed 1024-token limit for concise
+answers. Generation can finish before reaching the limit.
+
+For truncated output, increase `max_tokens` if the model context has room. Image and
+prompt tokens also consume context: if their sum with the requested output exceeds
+the server's context limit, reduce the output budget or input size instead.
+
+The Demo shows the layout/OCR devices, stage, and page/region progress. MCP provides
+the same task information through progress notifications and `runtime_status`;
+use the returned `request_id` to query a specific task. See [Demo usage](demo/README.md#use)
+and [MCP configuration](INSTALL.md#mcp-tasks) for details.
+
 ## Community model conversions
 
 ### GGUF quantizations

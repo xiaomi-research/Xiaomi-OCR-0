@@ -515,24 +515,14 @@ function inlineTex(s) {
 
 /**
  * 修复 OCR 常见 LaTeX 污染，让 KaTeX 可解析：
- *   \{r\} → {r}          （多余转义花括号）
- *   \{top\} → \top       （OCR 把 \top 读成花括号包字）
  *   \] 单独成行 + (5)  → 合并进 math 块为 \tag{5}
- *   \left\{ \right\}   → 保护，不被误改
+ *   合法的 \{ \}、\left\{ \right\} 和分组花括号保持原样
  */
 function sanitizeLatex(t) {
   let s = String(t || "");
-  // 1) protect legitimate \left\{ \right\} delimiters
-  s = s.replace(/\\left\\([{\[(])/g, "\x00L$1");
-  s = s.replace(/\\right\\([}\])])/g, "\x00R$1");
-  // 2) \{top\} → \top
-  s = s.replace(/\\\{top\\\}/g, "\\top");
-  s = s.replace(/\\\{bot\\\}/g, "\\bot");
-  // 3) \{ \} → { }   (extra escapes OCR emits around grouping)
-  s = s.replace(/\\\{/g, "{").replace(/\\\}/g, "}");
-  // 4) restore
-  s = s.replace(/\x00L/g, "\\left\\").replace(/\x00R/g, "\\right\\");
-  // 5) merge equation number that OCR put on the next line after \]
+  // Escaped braces (including \{top\}) can be valid literal notation.
+  // Preserve them rather than guessing that the OCR intended grouping/commands.
+  // Merge equation number that OCR put on the next line after \]
   //    "...\]\n\n(5)\n"  →  "...\\tag{5}\n\]\n"
   s = s.replace(/\\]\s*\n+\s*\((\d{1,3})\)\s*\n/g, "\\tag{$1}\n\\]\n");
   return s;
@@ -913,118 +903,55 @@ const LIVE_PROMPT =
   "ignoring headers and footers. Tables should be expressed in OTSL format, formulas in the document should " +
   "be represented using LATEX format, and the parsing should be organized according to the reading order.";
 
-/**
- * Real streaming OCR via SSE proxy.
- * onDelta(textChunk) fires as tokens arrive.
- * Resolves { latency_ms, usage, model, content }.
- */
-async function streamLiveOcr(dataUrl, onDelta, prompt, task) {
+/** The browser receives shared monitoring snapshots and one final result. */
+async function runImageOcr(dataUrl, prompt, task, mode) {
   const c = cfg();
   const body = {
-    image_base64: dataUrl,
-    prompt: prompt || LIVE_PROMPT,
-    task: task || "document",
-    fields: $("kieFields").value || "",
-    question: $("vqaQuestion").value || "",
-    temperature: 0,
+    image_base64: dataUrl, prompt: prompt || LIVE_PROMPT, task: task || "document",
+    fields: $("kieFields").value || "", question: $("vqaQuestion").value || "",
     max_tokens: task === "vqa" ? 1024 : Math.max(1, Math.min(16384, c.max_tokens || 4096)),
   };
   const ac = new AbortController();
-  const timer = setTimeout(function () { ac.abort(); }, 90000);
-  let res;
+  const timer = setTimeout(() => ac.abort(), 300000);
+  let reader;
   try {
-    res = await fetch("/api/ocr/stream", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify(body),
-      signal: ac.signal,
-    });
-  } catch (e) {
-    clearTimeout(timer);
-    if (e.name === "AbortError") throw new Error("请求超时（90s）");
-    throw e;
-  }
-  if (!res.ok) {
-    clearTimeout(timer);
-    let msg = "HTTP " + res.status;
-    try {
-      const j = await res.json();
-      if (j.error) msg = j.error;
-    } catch (e) { /* ignore */ }
-    throw new Error(msg);
-  }
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  let content = "";
-  let doneMeta = null;
-  let err = null;
-
-  try {
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split("\n\n");
-    buf = parts.pop() || "";
-    for (const part of parts) {
-      let ev = "message";
-      let data = "";
-      for (const line of part.split("\n")) {
-        if (line.startsWith("event:")) ev = line.slice(6).trim();
-        else if (line.startsWith("data:")) data += line.slice(5).trim();
-      }
-      if (!data) continue;
-      let obj;
-      try { obj = JSON.parse(data); } catch (e) { continue; }
-      if (ev === "delta" && obj.t) {
-        content += obj.t;
-        if (onDelta) onDelta(obj.t, content);
-      } else if (ev === "done") {
-        doneMeta = obj;
-      } else if (ev === "error") {
-        err = obj.error || "stream error";
+    const path = mode === "region" ? "/api/parse/regions/stream" : "/api/ocr/stream";
+    const res = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body), signal: ac.signal});
+    if (!res.ok) {
+      const error = await res.json();
+      throw new Error(error.error || ("HTTP " + res.status));
+    }
+    reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "", result = null;
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      buffer += decoder.decode(part.value, {stream: true});
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+      for (const block of events) {
+        let event = "", data = "";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+        const value = JSON.parse(data);
+        if (event === "progress") showRuntime(value);
+        if (event === "error") throw new Error(value.error || "OCR failed");
+        if (event === "done") result = value;
       }
     }
-  }
+    if (!result) throw new Error("推理流中断，未收到完成事件");
+    return result;
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("解析超时（300s）");
+    throw error;
   } finally {
     clearTimeout(timer);
-    try { reader.cancel(); } catch (e) { /* ignore */ }
-  }
-  if (err) throw new Error(err);
-  if (!doneMeta) throw new Error("推理流中断，未收到完成事件");
-  return {
-    latency_ms: doneMeta ? doneMeta.latency_ms : 0,
-    usage: (doneMeta && doneMeta.usage) || {},
-    model: (doneMeta && doneMeta.model) || "SeerRay-Lab/Xiaomi-OCR-0",
-    content: doneMeta && typeof doneMeta.content === "string" ? doneMeta.content : content,
-  };
-}
-
-/** Parse all regions and display the assembled document once it is complete. */
-async function runRegionOcr(dataUrl) {
-  const c = cfg();
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 120000);
-  try {
-    const res = await fetch("/api/parse/regions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image_base64: dataUrl,
-        max_tokens: Math.max(1, Math.min(c.max_tokens || 2048, 4096)),
-        concurrency: 16,
-      }),
-      signal: ac.signal,
-    });
-    const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || "HTTP " + res.status);
-    return data;
-  } catch (e) {
-    if (e.name === "AbortError") throw new Error("区域解析超时（120s）");
-    throw e;
-  } finally {
-    clearTimeout(timer);
+    if (reader) await reader.cancel().catch(() => {});
   }
 }
 
@@ -1057,9 +984,10 @@ async function runPdfParse(file) {
   if (!start.ok || started.error) throw new Error(started.error || ("HTTP " + start.status));
   let status;
   while (true) {
-    await new Promise(function (resolve) { setTimeout(resolve, 800); });
+    await new Promise(function (resolve) { setTimeout(resolve, 1000); });
     const res = await fetch("/api/book/" + encodeURIComponent(started.id));
     status = await res.json();
+    if (status.monitor) showRuntime(status.monitor);
     if (!res.ok) throw new Error(status.error || "读取 PDF 任务状态失败");
     const total = status.total || 0;
     const done = status.done || 0;
@@ -1079,19 +1007,6 @@ async function runPdfParse(file) {
     usage: status.usage || {}, model: status.model || "SeerRay-Lab/Xiaomi-OCR-0", pages: status.total || 0, warning: status.status !== "done" ? (status.error || "部分页面未完成") : "" };
 }
 
-function formatKieResult(rawText) {
-  const match = String(rawText || "").match(/\{[\s\S]*\}/);
-  if (!match) return { json: null, raw: rawText, warning: "Model output did not contain a JSON object" };
-  try {
-    let data = JSON.parse(match[0]);
-    const fields = $("kieFields").value.split(/[\n,，]+/).map(function (x) { return x.trim(); }).filter(Boolean);
-    if (fields.length && data && typeof data === "object" && !Array.isArray(data)) {
-      data = Object.fromEntries(fields.map(function (field) { return [field, data[field] == null ? "" : data[field]]; }));
-    }
-    return { json: data };
-  } catch (e) { return { json: null, raw: rawText, warning: "Model output contained invalid JSON" }; }
-}
-
 $("srcPane").onclick = async function () {
   if (state.busy) return;
   const item = itemById(state.activeId);
@@ -1105,12 +1020,13 @@ $("srcPane").onclick = async function () {
   clearError();
   resetResult();
   setBusy(true);
+  resetRuntimeProgress();
   firePulse();
   $("imgWrap").classList.add("thinking");
   const hint = $("clickHint");
   if (hint) { uiText(hint, () => t(isPdf ? "PDF 解析中…" : (useRegion ? "区域解析中…" : "思考中…"))); hint.style.opacity = "1"; }
-  uiText("sideHint", () => t(isPdf ? "PDF 页面渲染与解析中" : (useRegion ? "layout + 并发 region OCR" : "流式输出中")));
-  uiText("stageHint", () => t(isPdf ? "PDF…" : (useRegion ? "REGION…" : "STREAMING…")));
+  uiText("sideHint", () => t(isPdf ? "PDF 页面渲染与解析中" : (useRegion ? "版面检测与区域识别" : "识别中…")));
+  uiText("stageHint", () => t(isPdf ? "PDF…" : (useRegion ? "REGION…" : "OCR…")));
   uiText("badgeRight", () => t("LIVE"));
   $("badgeRight").className = "badge on";
 
@@ -1140,7 +1056,7 @@ $("srcPane").onclick = async function () {
     } else {
       const dataUrl = await stageImageDataUrl();
       if (useRegion) {
-      data = await runRegionOcr(dataUrl);
+      data = await runImageOcr(dataUrl, "", "document", "region");
       const regions = data.regions || [];
       const count = regions.length;
       const okN = regions.filter(region => region.ok).length;
@@ -1152,21 +1068,13 @@ $("srcPane").onclick = async function () {
       uiText("pillTok", () => "TOKENS " + ((data.usage && data.usage.completion_tokens) || "—"));
       uiText("pillModeText", () => t("REGION · " + okN + "/" + count));
       setLed("on");
-      uiText("sideHint", () => t("版面检测 {ms}ms · 并发 {count}", {ms: data.layout_ms || 0, count: data.concurrency || 16}));
+      uiText("sideHint", () => t("版面检测 {ms}ms · 并发 {count}", {ms: data.layout_ms || 0, count: data.concurrency || 4}));
       uiText("stageHint", () => t("REGION · " + count + " · " + okN + " ok"));
       if (hint) { uiText(hint, () => t("点击解析")); hint.style.opacity = ""; }
       } else {
       const chosenPrompt = task === "document" ? ($("docPrompt").value || LIVE_PROMPT) : "";
-      data = await streamLiveOcr(dataUrl, function (chunk, full) {
-        el.textContent = full;
-        const pane = $("resPane");
-        pane.scrollTop = pane.scrollHeight;
-      }, chosenPrompt, task);
+      data = await runImageOcr(dataUrl, chosenPrompt, task, "page");
       let finalContent = (data.content || "").trim();
-      if (task === "kie") {
-        const kie = formatKieResult(finalContent);
-        finalContent = JSON.stringify(kie.json === null ? kie : kie.json, null, 2);
-      }
       el.classList.remove("typing");
       el.classList.add("markdown");
       recordResult(finalContent, data);
@@ -1188,6 +1096,7 @@ $("srcPane").onclick = async function () {
       el.textContent = "";
       $("resEmpty").style.display = "flex";
       showError(e.message || String(e));
+      markRuntimeError();
       uiText("badgeRight", () => t("ERROR"));
       $("badgeRight").className = "badge";
       setLed("err");
@@ -1201,6 +1110,138 @@ $("srcPane").onclick = async function () {
     if (isPdf) setTimeout(function () { $("taskProgress").hidden = true; }, 1100);
   }
 };
+
+// Runtime snapshots come from the shared monitor. Idle pages do not poll devices.
+let runtimeState = null, runtimeReceivedAt = 0;
+const STAGE_LABELS = {
+  request: "任务", inspect_runtime: "读取设备信息", prepare_image: "准备图片", prepare_pdf: "读取 PDF",
+  render_pdf: "渲染 PDF 页面", import: "导入版面组件", load: "加载版面模型", queue: "等待可用资源",
+  inference: "推理", assemble: "整理结果", assemble_pdf: "合并 PDF", heartbeat: "处理中",
+};
+function deviceLabel(info) {
+  if (!info) return t("等待设备信息");
+  if (info.display_device === "not_loaded") return t("尚未加载");
+  if (!info.display_device || info.display_device === "unknown") return t("未知设备");
+  return info.display_device;
+}
+function showRuntime(state) {
+  if (!state) return;
+  if (state !== runtimeState) {
+    runtimeState = state;
+    runtimeReceivedAt = performance.now();
+  }
+  const components = state.components || {};
+  for (const name of ["layout", "ocr"]) {
+    const info = components[name];
+    if (!info) continue;
+    const label = deviceLabel(info);
+    uiText("runtime" + (name === "layout" ? "Layout" : "Ocr"), () => deviceLabel(info));
+    const detail = [info.model, info.source];
+    if (info.requested_device) detail.push("requested: " + info.requested_device);
+    if (info.cache_age_ms != null) detail.push("cache: " + (info.cache_age_ms / 1000).toFixed(1) + "s");
+    if (info.gpu_processes) info.gpu_processes.forEach(p => detail.push("PID " + p.pid + " · GPU " + p.gpu_index + " · " + p.used_memory_mib + " MiB"));
+    if (info.note) detail.push(info.note);
+    if (info.errors) detail.push(JSON.stringify(info.errors));
+    $("runtime" + (name === "layout" ? "Layout" : "Ocr")).title = detail.filter(Boolean).join("\n");
+    uiText("runtime" + (name === "layout" ? "LayoutDetail" : "OcrDetail"), () => {
+      if (name === "layout" && info.loaded && info.requested_device && info.requested_device !== "auto" && info.requested_device !== info.device)
+        return t("请求 {requested}，实际 {actual}", {requested: info.requested_device, actual: label});
+      if (info.device === "unknown") return info.note || t("尚无实际设备依据");
+      return name === "layout" ? "PP-DocLayoutV3" : (info.backend || "Xiaomi-OCR-0");
+    });
+  }
+  const counts = Object.entries(state.progress_counts || {});
+  const regions = counts.filter(([key]) => key.startsWith("ocr/regions"));
+  const rows = counts.filter(([key]) => !key.startsWith("ocr/regions")).concat(regions.slice(-8));
+  const fragment = document.createDocumentFragment();
+  for (const [key, count] of rows) {
+    const page = key.match(/page=(\d+)/);
+    const title = key.includes("rendered_pages") ? t("已渲染页面") : key.includes("recognized_pages") ? t("已处理页面")
+      : key.includes("failed_pages") ? t("失败页面") : key.includes("blank_pages") ? t("空白页面")
+      : page ? t("第 {page} 页区域", {page: page[1]}) : t("区域");
+    const row = document.createElement("div"), name = document.createElement("span"), value = document.createElement("b");
+    name.textContent = title;
+    value.textContent = count.completed + " / " + count.total;
+    row.append(name, value);
+    fragment.appendChild(row);
+  }
+  if (regions.length > 8) {
+    const more = document.createElement("span");
+    more.className = "runtime-more";
+    more.textContent = t("另 {count} 页区域已记录", {count: regions.length - 8});
+    fragment.appendChild(more);
+  }
+  $("runtimeCounts").replaceChildren(fragment);
+  $("runtimeTaskId").textContent = state.request_id || "";
+  $("runtimeEvidence").textContent = ["layout", "ocr"].map(name => {
+    const info = components[name];
+    if (!info) return "";
+    return (name === "layout" ? t("版面检测") : "OCR") + ": " + (info.source || "—")
+      + (info.cache_age_ms != null ? " · " + t("缓存 {seconds}s", {seconds: (info.cache_age_ms / 1000).toFixed(0)}) : "");
+  }).filter(Boolean).join("\n");
+  paintRuntimeStage();
+}
+function paintRuntimeStage() {
+  const state = runtimeState;
+  if (!state) return;
+  const summary = state.summary || {};
+  const running = state.status === "running";
+  const delta = running ? performance.now() - runtimeReceivedAt : 0;
+  const seconds = (((state.elapsed_ms || 0) + delta) / 1000).toFixed(1);
+  const phase = summary.phase;
+  const terminal = {completed: "已完成", partial: "部分完成", failed: "失败", cancelled: "已取消"};
+  const phaseLabel = phase === "inference" ? (summary.component === "layout" ? "版面检测中" : "文字识别中") : STAGE_LABELS[phase] || "处理中";
+  const label = terminal[state.status] || (!state.tool ? (running ? "任务启动中…" : "准备就绪") : phaseLabel);
+  $("runtimePanel").dataset.status = state.status || "idle";
+  uiText("runtimeStageLabel", () => t(label));
+  $("runtimeElapsed").textContent = state.tool ? seconds + "s" : "";
+  const pages = summary.pages, regions = summary.regions;
+  const count = pages || regions;
+  const countLabel = count ? t(pages ? "页面 {done}/{total}" : "区域 {done}/{total}", {done: count.completed, total: count.total}) : "";
+  $("runtimeCountLabel").textContent = countLabel;
+  const bar = $("runtimeProgress");
+  bar.hidden = !count || count.total <= 0;
+  bar.max = count ? count.total || 1 : 1;
+  bar.value = count ? count.completed : 0;
+  bar.setAttribute("aria-valuetext", countLabel);
+  const activePages = summary.active_pages || [];
+  const context = [];
+  if (running && activePages.length) context.push(t("正在处理第 {pages} 页", {pages: activePages.join(", ")}));
+  if (pages && regions) context.push(t("已完成 {count} 个区域", {count: regions.completed}));
+  if (pages && pages.blank) context.push(t("{count} 页空白", {count: pages.blank}));
+  $("runtimeContext").textContent = context.join(" · ");
+  $("runtimeContext").title = context.join(" · ");
+  const issue = state.error || state.warning || "";
+  $("runtimeIssue").textContent = issue;
+  $("runtimeIssue").hidden = !issue;
+  const fragment = document.createDocumentFragment();
+  (running ? state.active_stages || [] : []).slice(0, 4).forEach(s => {
+    const line = document.createElement("span");
+    line.textContent = [s.component === "layout" ? t("版面检测") : s.component === "ocr" ? "OCR" : "",
+      t(STAGE_LABELS[s.stage] || s.stage), s.page ? t("第 {page} 页", {page: s.page}) : "",
+      s.region ? t("区域 {region}", {region: s.region}) : "", ((s.elapsed_ms + delta) / 1000).toFixed(1) + "s"].filter(Boolean).join(" · ");
+    fragment.appendChild(line);
+  });
+  $("runtimeStages").replaceChildren(fragment);
+}
+function resetRuntimeProgress() {
+  showRuntime({components: runtimeState ? runtimeState.components : {}, status: "running"});
+}
+function markRuntimeError() {
+  if (runtimeState) {
+    if (runtimeState.status !== "cancelled") runtimeState.status = "failed";
+    paintRuntimeStage();
+  } else {
+    showRuntime({status: "failed"});
+  }
+}
+setInterval(() => { if (!document.hidden && runtimeState && runtimeState.status === "running") paintRuntimeStage(); }, 1000);
+document.addEventListener("click", event => {
+  if (!$("runtimeDetails").contains(event.target)) $("runtimeDetails").open = false;
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") $("runtimeDetails").open = false;
+});
 
 /* load */
 function loadShowcase() {
@@ -1223,7 +1264,10 @@ function loadShowcase() {
   if (!localStorage.getItem(LS_KEY)) localStorage.setItem(LS_KEY, JSON.stringify(DEFAULT_CFG));
   loadShowcase();
   checkHealth();
-  setInterval(checkHealth, 30000);
+  fetch("/api/runtime").then(r => r.ok ? r.json() : Promise.reject()).then(info => {
+    if (!runtimeState) showRuntime(info);
+  }).catch(() => {});
+  setInterval(() => { if (!document.hidden) checkHealth(); }, 30000);
 })();
 
 function blobToDataUrl(blob) {
@@ -1318,6 +1362,7 @@ async function checkHealth() {
 // Refresh sample labels without resetting user input, task progress or OCR output.
 document.addEventListener("languagechange", () => {
   renderThumbs();
+  if (runtimeState) showRuntime(runtimeState);
   if (state.busy) document.querySelectorAll("#thumbs button").forEach(button => { button.disabled = true; });
   const item = itemById(state.activeId);
   if (item && !state.custom) $("stageImg").alt = t(item.title);

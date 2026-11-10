@@ -178,12 +178,12 @@ Overall is the arithmetic mean of the five subset scores. Two-stage inference us
 
 | Method | overall↑ | text_block_Edit_dist↓ | display_formula_CDM↑ | display_formula_Edit_dist↓ | table_TEDS↑ | table_TEDS_structure_only↑ | table_Edit_dist↓ | reading_order_Edit_dist↓ |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|
-| e2e | 94.629 | 0.0395 | 96.325 | 0.0988 | 91.5119 | 94.0208 | 0.0795 | 0.1364 |
-| 2stage | 96.4739 | 0.0332 | 98.3444 | 0.079 | 94.3973 | 96.6835 | 0.0544 | 0.1221 |
+| e2e | 95.1926 | 0.0341 | 96.4553 | 0.0937 | 92.5325 | 94.805 | 0.0707 | 0.1301 |
+| 2stage | 96.8277 | 0.0313 | 98.5044 | 0.0765 | 95.1087 | 97.1929 | 0.0483 | 0.1221 |
 
 ## Wild-OmniDocBench: reproduction reference results
 
 | Method | overall↑ | text_block_Edit_dist↓ | display_formula_CDM↑ | display_formula_Edit_dist↓ | table_TEDS↑ | table_TEDS_structure_only↑ | table_Edit_dist↓ | reading_order_Edit_dist↓ |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|
-| e2e | 83.9104 | 0.1379 | 87.7774 | 0.1691 | 77.7438 | 81.8345 | 0.1928 | 0.2164 |
-| 2stage | 83.9477 | 0.1262 | 78.983 | 0.1628 | 85.48 | 89.8564 | 0.1209 | 0.1967 |
+| e2e | 86.4806 | 0.1125 | 90.0734 | 0.1475 | 80.6184 | 84.3165 | 0.1658 | 0.1927 |
+| 2stage | 87.9438 | 0.1233 | 89.5485 | 0.1568 | 86.6129 | 90.9422 | 0.1104 | 0.1931 |

@@ -62,9 +62,8 @@ XIAOMI_OCR_MODEL=longwayxu/xiaomi-ocr-0:bf16 \
 bash skills/xiaomi-ocr/install.sh --agent=codex
 ```
 
-The installer creates/reuses the MCP environment and persists the URL and model
-in generated MCP JSON and Codex configuration. Set the URL and model explicitly;
-the current installer does not persist or interpret `XIAOMI_OCR_BACKEND`. For other agents omit
+The installer creates/reuses the MCP environment and persists the backend, URL and model
+in generated MCP JSON and Codex configuration. Set all three explicitly. For other agents omit
 `--agent=codex` and merge that JSON into the current agent. Existing authorization
 requirements for installations/downloads/configuration still apply. Restart/rescan
 the agent and verify a real request. The four tool schemas are unchanged; region

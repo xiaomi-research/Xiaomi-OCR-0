@@ -9,7 +9,7 @@ import tomlkit
 from pathlib import Path
 
 
-def updated_config(original, python, server_path, endpoint, model, repo):
+def updated_config(original, python, server_path, endpoint, model, repo, backend="openai"):
     document = tomlkit.parse(original)
     servers = document.setdefault("mcp_servers", tomlkit.table())
     entry = servers.setdefault("xiaomi-ocr", tomlkit.table())
@@ -22,6 +22,7 @@ def updated_config(original, python, server_path, endpoint, model, repo):
     env["XIAOMI_OCR_LOCAL_URL"] = endpoint
     env["XIAOMI_OCR_MODEL"] = model
     env["XIAOMI_OCR_REPO"] = str(repo)
+    env["XIAOMI_OCR_BACKEND"] = backend
     updated = tomlkit.dumps(document)
     tomlkit.parse(updated)
 
@@ -52,7 +53,8 @@ def main() -> int:
 
     original = config.read_text(encoding="utf-8") if config.exists() else ""
     updated = updated_config(original, python, skill_dir / "mcp_ocr_server.py", endpoint, model,
-                             os.environ.get("XIAOMI_OCR_REPO", str(skill_dir.parents[1])))
+                             os.environ.get("XIAOMI_OCR_REPO", str(skill_dir.parents[1])),
+                             os.environ.get("XIAOMI_OCR_BACKEND", "openai"))
 
     config.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix="config.toml.", dir=config.parent)
@@ -67,7 +69,7 @@ def main() -> int:
             os.unlink(temp_name)
 
     print(f"Registered Xiaomi-OCR MCP server in {config}.")
-    print("Restart Codex to load the four OCR, PDF, KIE, and VQA tools.")
+    print("Restart Codex to load the OCR tools and runtime_status.")
     return 0
 
 
