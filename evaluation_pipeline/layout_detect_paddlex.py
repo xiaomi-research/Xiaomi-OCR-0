@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -94,6 +95,124 @@ def extract_boxes(result: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _polygon_shoelace_area(points: Any) -> float:
+    area = 0.0
+    n = len(points)
+    for idx in range(n):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % n]
+        area += x1 * y2 - x2 * y1
+    return 0.5 * abs(area)
+
+
+def _clip_polygon_to_page_rect(
+    pts: list[tuple[float, float]],
+    width: float,
+    height: float,
+) -> list[tuple[float, float]]:
+    poly = list(pts)
+    if len(poly) < 3 or width <= 0.0 or height <= 0.0:
+        return []
+    for kind, bound in (
+        ("x_min", 0.0),
+        ("x_max", float(width)),
+        ("y_min", 0.0),
+        ("y_max", float(height)),
+    ):
+        if not poly:
+            return []
+        clipped: list[tuple[float, float]] = []
+        n = len(poly)
+        for idx in range(n):
+            ax, ay = poly[idx - 1]
+            bx, by = poly[idx]
+            if kind == "x_min":
+                in_a, in_b = ax >= bound, bx >= bound
+                ix = bound
+                iy = ay + ((bound - ax) / (bx - ax) * (by - ay) if bx != ax else 0.0)
+            elif kind == "x_max":
+                in_a, in_b = ax <= bound, bx <= bound
+                ix = bound
+                iy = ay + ((bound - ax) / (bx - ax) * (by - ay) if bx != ax else 0.0)
+            elif kind == "y_min":
+                in_a, in_b = ay >= bound, by >= bound
+                ix = ax + ((bound - ay) / (by - ay) * (bx - ax) if by != ay else 0.0)
+                iy = bound
+            else:
+                in_a, in_b = ay <= bound, by <= bound
+                ix = ax + ((bound - ay) / (by - ay) * (bx - ax) if by != ay else 0.0)
+                iy = bound
+            if in_b:
+                if not in_a:
+                    clipped.append((ix, iy))
+                clipped.append((bx, by))
+            elif in_a:
+                clipped.append((ix, iy))
+        poly = clipped
+    deduped: list[tuple[float, float]] = []
+    for px, py in poly:
+        if not deduped or abs(px - deduped[-1][0]) > 1e-9 or abs(py - deduped[-1][1]) > 1e-9:
+            deduped.append((px, py))
+    if (
+        len(deduped) > 1
+        and abs(deduped[-1][0] - deduped[0][0]) <= 1e-9
+        and abs(deduped[-1][1] - deduped[0][1]) <= 1e-9
+    ):
+        deduped.pop()
+    return deduped if len(deduped) >= 3 else []
+
+
+def _normalize_polygon_points(
+    raw_polygon: Any,
+    image_width: int,
+    image_height: int,
+    fallback_bbox_2d: list[int],
+) -> list[list[float]]:
+    """Clip raw polygon_points to page bounds and normalize to [0, 1000], falling back to 4-pt rect."""
+    x1_norm, y1_norm, x2_norm, y2_norm = fallback_bbox_2d
+    fallback = [
+        [x1_norm, y1_norm],
+        [x2_norm, y1_norm],
+        [x2_norm, y2_norm],
+        [x1_norm, y2_norm],
+    ]
+    if raw_polygon is None or image_width <= 0 or image_height <= 0:
+        return fallback
+    pts_raw = raw_polygon.tolist() if hasattr(raw_polygon, "tolist") else raw_polygon
+    if not isinstance(pts_raw, (list, tuple)) or len(pts_raw) < 3:
+        return fallback
+    raw_pts: list[tuple[float, float]] = []
+    for pt in pts_raw:
+        pt_seq = pt.tolist() if hasattr(pt, "tolist") else pt
+        if not isinstance(pt_seq, (list, tuple)) or len(pt_seq) < 2:
+            return fallback
+        try:
+            px = float(pt_seq[0])
+            py = float(pt_seq[1])
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return fallback
+        raw_pts.append((px, py))
+    clipped = _clip_polygon_to_page_rect(raw_pts, float(image_width), float(image_height))
+    if _polygon_shoelace_area(clipped) <= 1e-9:
+        return fallback
+    normalized: list[list[float]] = []
+    for px, py in clipped:
+        nx = max(0.0, min(1000.0, float(px) / float(image_width) * 1000.0))
+        ny = max(0.0, min(1000.0, float(py) / float(image_height) * 1000.0))
+        normalized.append([nx, ny])
+    deduped_norm: list[list[float]] = []
+    for pt in normalized:
+        if not deduped_norm or pt != deduped_norm[-1]:
+            deduped_norm.append(pt)
+    if len(deduped_norm) > 1 and deduped_norm[-1] == deduped_norm[0]:
+        deduped_norm.pop()
+    if len(deduped_norm) < 3 or _polygon_shoelace_area(deduped_norm) <= 0.0:
+        return fallback
+    return deduped_norm
+
+
 def serialize_regions(result: Any, image_width: int, image_height: int) -> list[dict[str, Any]]:
     regions = []
     for box in extract_boxes(result):
@@ -117,18 +236,18 @@ def serialize_regions(result: Any, image_width: int, image_height: int) -> list[
             int(x2 / image_width * 1000),
             int(y2 / image_height * 1000),
         ]
-        x1_normalized, y1_normalized, x2_normalized, y2_normalized = bbox_2d
+        polygon = _normalize_polygon_points(
+            box.get("polygon_points"),
+            image_width,
+            image_height,
+            bbox_2d,
+        )
         regions.append({
             "index": len(regions),
             "label": label,
             "score": float(box.get("score", 0.0)),
             "bbox_2d": bbox_2d,
-            "polygon": [
-                [x1_normalized, y1_normalized],
-                [x2_normalized, y1_normalized],
-                [x2_normalized, y2_normalized],
-                [x1_normalized, y2_normalized],
-            ],
+            "polygon": polygon,
             "task_type": task_type,
         })
     return regions
@@ -264,7 +383,7 @@ def main() -> None:
             "top_level": "input fields + layout_result",
             "region_fields": list(REGION_FIELDS),
             "bbox_coordinates": "normalized integers in [0, 1000]",
-            "polygon": "normalized four-point bbox rectangle",
+            "polygon": "normalized polygon_points in [0, 1000] when valid, else four-point bbox rectangle",
         },
         "label_task_mapping": LABEL_TASK_MAPPING,
     }
