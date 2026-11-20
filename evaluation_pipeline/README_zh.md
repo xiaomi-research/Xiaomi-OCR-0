@@ -123,6 +123,7 @@ python -m evaluation_pipeline.twostage_img2md \
 - 输入 JSONL 和 layout JSONL 中的图片路径字符串必须完全一致，脚本按该路径关联检测结果。
 - **每个 PaddleX 阈值都必须独立运行。** 原生后处理使高阈值结果不一定是低阈值结果按 score 过滤后的子集，不能通过离线过滤替代重新生成。比较阈值时使用独立的 layout 文件。
 - 区域表格同样使用 OTSL 提示词，在页面组装时转换为 HTML。评测对象是最终的页面级 Markdown。
+- 可选参数 `--polygon` 的推理阶段多边形裁切默认**关闭**；显式开启 `--polygon` 会用灰色 `(128, 128, 128)` 填充多顶点（>4 顶点）轮廓外区域并按轮廓外接框裁切（版面序列化输出已保留真实 `polygon`）。若使用旧版 `--layout-jsonl` 缓存（旧 PaddleX 四角矩形或缺少 `polygon` 字段的旧 HF 输出），需重新运行版面检测生成真实轮廓后 `--polygon` 才会生效。
 
 ## 评测
 
