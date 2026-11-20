@@ -24,6 +24,7 @@ Usage:
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import signal
@@ -236,6 +237,120 @@ def _unclip_boxes(boxes, unclip_ratio=None):
         return expanded_boxes
 
 
+def _shoelace_area_hf(pts) -> float:
+    area = 0.0
+    n_pts = len(pts)
+    for k in range(n_pts):
+        x_a, y_a = pts[k]
+        x_b, y_b = pts[(k + 1) % n_pts]
+        area += x_a * y_b - x_b * y_a
+    return 0.5 * abs(area)
+
+
+def _clip_polygon_to_page_rect(
+    pts: list[tuple[float, float]],
+    width: float,
+    height: float,
+) -> list[tuple[float, float]]:
+    poly = list(pts)
+    if len(poly) < 3 or width <= 0.0 or height <= 0.0:
+        return []
+    for kind, bound in (
+        ("x_min", 0.0),
+        ("x_max", float(width)),
+        ("y_min", 0.0),
+        ("y_max", float(height)),
+    ):
+        if not poly:
+            return []
+        clipped: list[tuple[float, float]] = []
+        n = len(poly)
+        for idx in range(n):
+            ax, ay = poly[idx - 1]
+            bx, by = poly[idx]
+            if kind == "x_min":
+                in_a, in_b = ax >= bound, bx >= bound
+                ix = bound
+                iy = ay + ((bound - ax) / (bx - ax) * (by - ay) if bx != ax else 0.0)
+            elif kind == "x_max":
+                in_a, in_b = ax <= bound, bx <= bound
+                ix = bound
+                iy = ay + ((bound - ax) / (bx - ax) * (by - ay) if bx != ax else 0.0)
+            elif kind == "y_min":
+                in_a, in_b = ay >= bound, by >= bound
+                ix = ax + ((bound - ay) / (by - ay) * (bx - ax) if by != ay else 0.0)
+                iy = bound
+            else:
+                in_a, in_b = ay <= bound, by <= bound
+                ix = ax + ((bound - ay) / (by - ay) * (bx - ax) if by != ay else 0.0)
+                iy = bound
+            if in_b:
+                if not in_a:
+                    clipped.append((ix, iy))
+                clipped.append((bx, by))
+            elif in_a:
+                clipped.append((ix, iy))
+        poly = clipped
+    deduped: list[tuple[float, float]] = []
+    for px, py in poly:
+        if not deduped or abs(px - deduped[-1][0]) > 1e-9 or abs(py - deduped[-1][1]) > 1e-9:
+            deduped.append((px, py))
+    if (
+        len(deduped) > 1
+        and abs(deduped[-1][0] - deduped[0][0]) <= 1e-9
+        and abs(deduped[-1][1] - deduped[0][1]) <= 1e-9
+    ):
+        deduped.pop()
+    return deduped if len(deduped) >= 3 else []
+
+
+def _normalize_hf_polygon(raw_polygon, img_width: float, img_height: float, bbox_2d: list[int]):
+    x1_norm, y1_norm, x2_norm, y2_norm = bbox_2d
+    fallback = [
+        [x1_norm, y1_norm],
+        [x2_norm, y1_norm],
+        [x2_norm, y2_norm],
+        [x1_norm, y2_norm],
+    ]
+    if raw_polygon is None or img_width <= 0 or img_height <= 0:
+        return fallback
+    pts_raw = raw_polygon.tolist() if hasattr(raw_polygon, "tolist") else raw_polygon
+    if not isinstance(pts_raw, (list, tuple)) or len(pts_raw) < 3:
+        return fallback
+    raw_pts = []
+    for pt in pts_raw:
+        pt_seq = pt.tolist() if hasattr(pt, "tolist") else pt
+        if not isinstance(pt_seq, (list, tuple)) or len(pt_seq) < 2:
+            return fallback
+        try:
+            px = float(pt_seq[0])
+            py = float(pt_seq[1])
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return fallback
+        raw_pts.append((px, py))
+    clipped = _clip_polygon_to_page_rect(raw_pts, float(img_width), float(img_height))
+    if _shoelace_area_hf(clipped) <= 1e-9:
+        return fallback
+    normalized = [
+        [
+            max(0.0, min(1000.0, float(px) / float(img_width) * 1000.0)),
+            max(0.0, min(1000.0, float(py) / float(img_height) * 1000.0)),
+        ]
+        for px, py in clipped
+    ]
+    deduped_norm = []
+    for pt in normalized:
+        if not deduped_norm or pt != deduped_norm[-1]:
+            deduped_norm.append(pt)
+    if len(deduped_norm) > 1 and deduped_norm[-1] == deduped_norm[0]:
+        deduped_norm.pop()
+    if len(deduped_norm) < 3 or _shoelace_area_hf(deduped_norm) <= 0.0:
+        return fallback
+    return deduped_norm
+
+
 def apply_layout_postprocess(
     raw_results, id2label, img_sizes,
     layout_nms=True, layout_unclip_ratio=None, layout_merge_bboxes_mode=None,
@@ -247,7 +362,9 @@ def apply_layout_postprocess(
         labels = result["labels"].cpu().numpy()
         boxes = result["boxes"].cpu().numpy()
         order_seq = result["order_seq"].cpu().numpy()
-        polygon_points = result.get("polygon_points", [])
+        polygon_points = result.get("polygon_points")
+        if polygon_points is None:
+            polygon_points = []
         img_size = img_sizes[img_idx]
         boxes_with_order = []
         for i in range(len(scores)):
@@ -255,7 +372,7 @@ def apply_layout_postprocess(
             score = float(scores[i])
             x1, y1, x2, y2 = boxes[i]
             order = int(order_seq[i])
-            boxes_with_order.append([cls_id, score, x1, y1, x2, y2, order])
+            boxes_with_order.append([cls_id, score, x1, y1, x2, y2, order, float(i)])
         if len(boxes_with_order) == 0:
             paddle_format_results.append([])
             continue
@@ -344,11 +461,20 @@ def apply_layout_postprocess(
             y2 = max(0, min(float(y2), img_height))
             if x1 >= x2 or y1 >= y2:
                 continue
-            image_results.append({
+            orig_idx = int(box_data[7]) if len(box_data) > 7 else -1
+            raw_poly = (
+                polygon_points[orig_idx]
+                if 0 <= orig_idx < len(polygon_points)
+                else None
+            )
+            det_entry = {
                 "cls_id": cls_id, "label": label_name, "score": score_val,
                 "coordinate": [int(x1), int(y1), int(x2), int(y2)],
                 "order": order,
-            })
+            }
+            if raw_poly is not None:
+                det_entry["polygon_points"] = raw_poly
+            image_results.append(det_entry)
         paddle_format_results.append(image_results)
     return paddle_format_results
 
@@ -413,10 +539,18 @@ def run_layout_detection(images, processor, model, device="cuda:0", threshold=LA
             y1_norm = int(float(y1) / image_height * 1000)
             x2_norm = int(float(x2) / image_width * 1000)
             y2_norm = int(float(y2) / image_height * 1000)
+            bbox_2d = [x1_norm, y1_norm, x2_norm, y2_norm]
+            polygon = _normalize_hf_polygon(
+                det.get("polygon_points"),
+                image_width,
+                image_height,
+                bbox_2d,
+            )
             results.append({
                 "index": valid_index, "label": label,
                 "score": float(score_val),
-                "bbox_2d": [x1_norm, y1_norm, x2_norm, y2_norm],
+                "bbox_2d": bbox_2d,
+                "polygon": polygon,
                 "task_type": task_type,
             })
             valid_index += 1

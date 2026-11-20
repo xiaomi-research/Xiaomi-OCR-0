@@ -120,6 +120,7 @@ Keep the following settings when reproducing two-stage results:
 - Image path strings in the input JSONL and layout JSONL must match exactly. The script uses these paths to associate detection results.
 - **Run PaddleX independently for each threshold.** Native postprocessing means higher-threshold results are not necessarily a subset obtained by filtering lower-threshold results by score. Offline filtering cannot replace regeneration. Use separate layout files when comparing thresholds.
 - Table regions also use OTSL prompts and are converted to HTML during page assembly. Evaluation uses the final page-level Markdown.
+- Optional `--polygon` inference-time crop masking stays **OFF by default**; pass `--polygon` to mask outside multi-vertex (>4 points) region polygons with neutral gray `(128, 128, 128)`. Note that serialized layout JSON now emits detector `polygon` contours, whereas legacy `--layout-jsonl` caches (4-point PaddleX rectangles or HF caches lacking `polygon`) must be regenerated for `--polygon` to take effect.
 
 ## Evaluation
 
